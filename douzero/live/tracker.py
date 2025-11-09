@@ -67,6 +67,7 @@ class LiveDurakTracker:
         self.table: List[Tuple[int, Optional[int]]] = []
         self.my_hand: List[int] = []
         self.discard_cards: List[int] = []
+        self._discard_cache: set[int] = set()
         self.talon_count: int = 0
         self.trump_card: Optional[int] = None
         self.trump_suit: Optional[int] = None
@@ -282,9 +283,11 @@ class LiveDurakTracker:
         if self.table:
             for attack_card, defense_card in self.table:
                 self.discard_cards.append(attack_card)
+                self._discard_cache.add(attack_card)
                 self.seen_cards.add(attack_card)
                 if defense_card is not None:
                     self.discard_cards.append(defense_card)
+                    self._discard_cache.add(defense_card)
                     self.seen_cards.add(defense_card)
         prev_attacker, prev_defender = self.attacker, self.defender
         self.table.clear()
@@ -366,7 +369,7 @@ class LiveDurakTracker:
         state = DurakState(
             hands=hands,  # type: ignore[arg-type]
             talon=talon,  # type: ignore[list-item]
-            discard=list(self.discard_cards),
+        discard=list(self.discard_cards),
             table=table,
             attacker=self.attacker,
             defender=self.defender,
@@ -389,8 +392,11 @@ class LiveDurakTracker:
         return any(defense is None for _, defense in self.table)
 
     def _estimate_opponent_count(self) -> int:
-        unseen = NUM_CARDS - len(self.seen_cards)
-        remaining = unseen - self.talon_count
+        discard_total = len(self._discard_cache)
+        table_cards = sum(1 + (defense is not None) for _, defense in self.table)
+        remaining = NUM_CARDS - discard_total - self.talon_count - len(self.my_hand) - table_cards
+        if self.defender_taking and self.defender == 1 - self.player_id:
+            remaining += len(self.pending_take_cards)
         return max(0, remaining)
 
     def _emit_recommendation(self, state: DurakState) -> None:
