@@ -48,7 +48,7 @@ For an interactive pipeline that mirrors these steps, open `notebooks/durakzero_
 
 To play against (or alongside) the model on a live server, use:
 
-* `notebooks/durakzero_live_helper.ipynb` – configure a checkpoint, choose whether to ingest packets via `pyshark` or a log file, and stream model suggestions directly inside the notebook.
+* `tools/durakzero_live_helper.sh` – terminal launcher for the real-time helper that tails packets (via `pyshark` or saved logs) and streams DurakZero suggestions with per-game transcripts.
 * `tools/durak_live_helper.py` – a command-line companion for the same workflow (`python tools/durak_live_helper.py --help`).
 
 ## Evaluation

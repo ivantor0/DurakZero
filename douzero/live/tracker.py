@@ -83,6 +83,7 @@ class LiveDurakTracker:
         self._last_summary_timestamp: float = 0.0
         self._role_prompted: bool = False
         self._initial_role: Optional[str] = None
+        self._state_dirty: bool = True
 
     def process_raw_line(self, raw_line: str) -> None:
         event = self._parse_line(raw_line)
@@ -174,6 +175,7 @@ class LiveDurakTracker:
             print(f"Updated hand ({len(self.my_hand)}): {formatted}")
         if self.game_active and not self._role_prompted and self.player_id is not None:
             self._prompt_initial_role()
+        self._mark_state_dirty()
 
     def _handle_turn(self, payload: Dict) -> None:
         self.talon_count = int(payload.get("deck", self.talon_count))
@@ -189,6 +191,7 @@ class LiveDurakTracker:
                 suit_idx = symbol_to_card_id(f"6{suit_symbol}")
                 if suit_idx is not None:
                     self.trump_suit = card_suit(suit_idx)
+        self._mark_state_dirty()
 
     def _handle_mode(self, payload: Dict) -> None:
         parsed: Dict[int, int] = {}
@@ -219,6 +222,7 @@ class LiveDurakTracker:
         self.table.append((card, None))
         self.seen_cards.add(card)
         self.pending_cleanup = None
+        self._mark_state_dirty()
 
     def _handle_b(self, payload: Dict) -> None:
         attack_card = symbol_to_card_id(payload.get("c", ""))
@@ -239,6 +243,7 @@ class LiveDurakTracker:
         if self.defender == self.player_id and defense_card in self.my_hand:
             self.my_hand.remove(defense_card)
         self.seen_cards.add(defense_card)
+        self._mark_state_dirty()
 
     def _handle_take(self, payload: Dict) -> None:
         self.defender_taking = True
@@ -249,13 +254,16 @@ class LiveDurakTracker:
                 self.pending_take_cards.append(defense_card)
         self.pending_cleanup = "take"
         self._log("[event] defender announced take")
+        self._mark_state_dirty()
 
     def _handle_done(self, payload: Dict) -> None:
         self.pending_cleanup = "defense"
+        self._mark_state_dirty()
 
     def _handle_pass(self, payload: Dict) -> None:
         # Optional message from the server when the attacker declines to add more cards.
         self.pending_cleanup = self.pending_cleanup or "defense"
+        self._mark_state_dirty()
 
     def _handle_end_turn(self, payload: Dict) -> None:
         self._finalize_round()
@@ -264,6 +272,7 @@ class LiveDurakTracker:
             self.attacker = next_attacker
             self.defender = 1 - next_attacker
         self._log(f"[event] end_turn -> next attacker: {self.attacker}")
+        self._mark_state_dirty()
 
     def _handle_order(self, payload: Dict) -> None:  # pragma: no cover - informational
         pass
@@ -315,6 +324,7 @@ class LiveDurakTracker:
             self.defender = prev_attacker
             self.last_round_winner = self.attacker
         self._log("[round] cards moved to discard")
+        self._mark_state_dirty()
 
     def _update_phase_after_event(self) -> None:
         if not self.table:
@@ -345,7 +355,9 @@ class LiveDurakTracker:
             return
         key = self._recommendation_key(state)
         if key == self._last_recommendation_key:
-            return
+            if not self._state_dirty:
+                return
+        self._state_dirty = False
         self._last_recommendation_key = key
         self._emit_recommendation(state)
 
@@ -542,6 +554,7 @@ class LiveDurakTracker:
         if self.verbose:
             print(f"Assuming you start as {role_text}.")
         self._log(f"[role] user selected {role_text}")
+        self._mark_state_dirty()
 
     def _infer_roles_from_mode(self) -> None:
         if not self.last_mode:
@@ -561,6 +574,10 @@ class LiveDurakTracker:
         if not self.verbose:
             return
         print("\033[2J\033[H", end="")
+
+    def _mark_state_dirty(self) -> None:
+        self._state_dirty = True
+        self._last_recommendation_key = None
 
 
 __all__ = ["LiveDurakTracker", "LiveGameEvent"]

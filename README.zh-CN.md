@@ -31,7 +31,7 @@ python train.py
 
 若希望在真实在线对局中获得模型建议，可以使用：
 
-* `notebooks/durakzero_live_helper.ipynb`：在 Notebook 中设置模型、选择 `pyshark` 或日志文件作为输入，实时查看 DurakZero 给出的推荐。
+* `tools/durakzero_live_helper.sh`：终端脚本，可选择通过 `pyshark` 或日志文件捕获数据流，并在命令行中输出 DurakZero 的实时推荐及对局日志。
 * `tools/durak_live_helper.py`：命令行版本的实时助手（运行 `python tools/durak_live_helper.py --help` 查看参数）。
 
 ## 评估
