@@ -68,6 +68,8 @@ def main() -> None:
     parser.add_argument('--checkpoint', required=True, help='Path to model checkpoint (model.tar).')
     parser.add_argument('--device', default='cpu', help='Device for inference: cpu, cuda, or GPU index.')
     parser.add_argument('--player-id', type=int, default=None, help='Override detected player seat (0 or 1).')
+    parser.add_argument('--log-dir', type=Path, default=None,
+                        help='If provided, write per-game transcripts to this directory.')
     parser.add_argument('--source', choices=['pyshark', 'file'], default='pyshark',
                         help='How to ingest live packets.')
     parser.add_argument('--interface', default='waydroid0', help='Network interface for pyshark capture.')
@@ -78,8 +80,13 @@ def main() -> None:
     model = load_model(args.checkpoint, device=args.device)
 
     tracker_device = _resolve_device(args.device)
-    tracker = LiveDurakTracker(model=model, device=tracker_device,
-                               player_id=args.player_id, verbose=True)
+    tracker = LiveDurakTracker(
+        model=model,
+        device=tracker_device,
+        player_id=args.player_id,
+        verbose=True,
+        log_dir=args.log_dir,
+    )
 
     if args.source == 'file':
         if args.log_file is None:

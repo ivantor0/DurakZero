@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import io
 import json
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
@@ -41,12 +43,15 @@ class LiveDurakTracker:
         device: torch.device,
         player_id: Optional[int] = None,
         verbose: bool = True,
+        log_dir: Optional[Path] = None,
     ) -> None:
         self.model = model
         self.device = device
         self.player_id = player_id
         self.verbose = verbose
         self.flags = SimpleNamespace(exp_epsilon=0.0)
+        self.log_dir = Path(log_dir) if log_dir is not None else None
+        self._log_handle: Optional[io.TextIOWrapper] = None
         self.reset()
 
     # ------------------------------------------------------------------
@@ -54,6 +59,9 @@ class LiveDurakTracker:
     # ------------------------------------------------------------------
 
     def reset(self) -> None:
+        if hasattr(self, "_log_handle") and self._log_handle is not None:
+            self._log_handle.close()
+            self._log_handle = None
         self.game_id: Optional[int] = None
         self.game_active = False
         self.table: List[Tuple[int, Optional[int]]] = []
@@ -80,8 +88,9 @@ class LiveDurakTracker:
         handler = getattr(self, f"_handle_{event.tag}", None)
         if handler is not None:
             handler(event.payload)
-            self._update_phase_after_event()
-            self._maybe_recommend()
+        self._log_raw_line(raw_line)
+        self._update_phase_after_event()
+        self._maybe_recommend()
 
     # ------------------------------------------------------------------
     # Parsing helpers
@@ -114,8 +123,10 @@ class LiveDurakTracker:
         if self.player_id is None:
             self.player_id = payload.get("position", 0)
         self.seen_cards.clear()
+        self._open_log_file()
         if self.verbose:
             print(f"\n>>> Joined game {self.game_id} as player {self.player_id}")
+        self._log(f"# Joined game {self.game_id} as player {self.player_id}")
 
     def _handle_game_start(self, payload: Dict) -> None:  # noqa: D401 - alias
         self._handle_game(payload)
@@ -131,6 +142,7 @@ class LiveDurakTracker:
             print(f"Game over. Winner ids: {winner_list}")
         self.game_active = False
         self.pending_cleanup = None
+        self._log(f"# Game over payload: {payload}")
 
     def _handle_win(self, payload: Dict) -> None:
         if self.verbose:
@@ -160,7 +172,14 @@ class LiveDurakTracker:
                     self.trump_suit = card_suit(suit_idx)
 
     def _handle_mode(self, payload: Dict) -> None:
-        self.last_mode = payload
+        parsed: Dict[int, int] = {}
+        for key, value in payload.items():
+            try:
+                parsed[int(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+        self.last_mode = parsed
+        self._infer_roles_from_mode()
 
     def _handle_t(self, payload: Dict) -> None:
         card = symbol_to_card_id(payload.get("c", ""))
@@ -210,6 +229,7 @@ class LiveDurakTracker:
             if defense_card is not None:
                 self.pending_take_cards.append(defense_card)
         self.pending_cleanup = "take"
+        self._log("[event] defender announced take")
 
     def _handle_done(self, payload: Dict) -> None:
         self.pending_cleanup = "defense"
@@ -224,6 +244,7 @@ class LiveDurakTracker:
         if next_attacker is not None:
             self.attacker = next_attacker
             self.defender = 1 - next_attacker
+        self._log(f"[event] end_turn -> next attacker: {self.attacker}")
 
     def _handle_order(self, payload: Dict) -> None:  # pragma: no cover - informational
         pass
@@ -255,6 +276,7 @@ class LiveDurakTracker:
             self.pending_take_cards = []
             self.pending_cleanup = None
             self.table.clear()
+            self._log("[round] defender took the table")
             return
 
         if self.table:
@@ -271,6 +293,7 @@ class LiveDurakTracker:
             self.attacker = prev_defender
             self.defender = prev_attacker
             self.last_round_winner = self.attacker
+        self._log("[round] cards moved to discard")
 
     def _update_phase_after_event(self) -> None:
         if not self.table:
@@ -366,15 +389,8 @@ class LiveDurakTracker:
         return any(defense is None for _, defense in self.table)
 
     def _estimate_opponent_count(self) -> int:
-        deck = self.talon_count
-        discard = len(self.discard_cards)
-        table_count = 0
-        for attack, defense in self.table:
-            table_count += 1
-            if defense is not None:
-                table_count += 1
-        total_known = len(self.my_hand) + discard + deck + table_count
-        remaining = NUM_CARDS - total_known
+        unseen = NUM_CARDS - len(self.seen_cards)
+        remaining = unseen - self.talon_count
         return max(0, remaining)
 
     def _emit_recommendation(self, state: DurakState) -> None:
@@ -391,20 +407,35 @@ class LiveDurakTracker:
         suggestions = list(zip(legal_actions, values))
         suggestions.sort(key=lambda item: item[1], reverse=True)
 
+        best_action_id, best_value = suggestions[0]
+        best_label = self._action_to_text(best_action_id)
+
         if not self.verbose:
+            self._log(
+                f"[recommendation] best={best_label} ({best_value:.3f}), "
+                f"legal={len(legal_actions)}"
+            )
             return
 
         now = time.time()
-        if now - self._last_summary_timestamp > 0.2:
-            self._print_state_summary(state)
-            self._last_summary_timestamp = now
+        self._clear_terminal()
+        self._print_state_summary(state)
+        self._last_summary_timestamp = now
 
-        print("Top recommendations:")
+        print(f"\n>>> BEST MOVE: {best_label} <<<")
+        print(f"Estimated value: {best_value: .3f}")
+        print("\nOther options:")
         for idx, (action_id, value) in enumerate(suggestions[:5], start=1):
             label = self._action_to_text(action_id)
             marker = "*" if action_id == legal_actions[action_index] else " "
             print(f"  {marker} #{idx}: {label:<12s} | Q = {value: .3f}")
         print("-")
+        self._log(
+            "[recommendation] "
+            + ", ".join(
+                f"{self._action_to_text(a)}={v:.3f}" for a, v in suggestions[:5]
+            )
+        )
 
     def _print_state_summary(self, state: DurakState) -> None:
         trump_symbol = card_id_to_symbol(self.trump_card) if self.trump_card is not None else "?"
@@ -433,6 +464,54 @@ class LiveDurakTracker:
         if action_id == ACTION_TAKE_CARDS:
             return "Take cards"
         return card_id_to_symbol(action_id)
+
+    # ------------------------------------------------------------------
+    # Logging and utilities
+    # ------------------------------------------------------------------
+
+    def _open_log_file(self) -> None:
+        if self.log_dir is None or self.game_id is None:
+            return
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = self.log_dir / f"{self.game_id}.log"
+        if self._log_handle is not None:
+            self._log_handle.close()
+        self._log_handle = log_path.open("w", encoding="utf-8")
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        self._log_handle.write(f"# Durak game {self.game_id} started at {timestamp}\n")
+        self._log_handle.flush()
+
+    def _log_raw_line(self, raw_line: str) -> None:
+        if self._log_handle is None:
+            return
+        self._log_handle.write(raw_line.strip() + "\n")
+        self._log_handle.flush()
+
+    def _log(self, message: str) -> None:
+        if self._log_handle is None:
+            return
+        timestamp = time.strftime("%H:%M:%S", time.localtime())
+        self._log_handle.write(f"[{timestamp}] {message}\n")
+        self._log_handle.flush()
+
+    def _infer_roles_from_mode(self) -> None:
+        if not self.last_mode:
+            return
+        attacker_candidates = [pid for pid, value in self.last_mode.items() if value < 8]
+        defender_candidates = [pid for pid, value in self.last_mode.items() if value >= 8]
+        if attacker_candidates:
+            attacker = attacker_candidates[0]
+            self.attacker = attacker
+            self.defender = 1 - attacker
+        elif defender_candidates:
+            defender = defender_candidates[0]
+            self.defender = defender
+            self.attacker = 1 - defender
+
+    def _clear_terminal(self) -> None:
+        if not self.verbose:
+            return
+        print("\033[2J\033[H", end="")
 
 
 __all__ = ["LiveDurakTracker", "LiveGameEvent"]
