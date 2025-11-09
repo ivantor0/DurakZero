@@ -559,6 +559,8 @@ class LiveDurakTracker:
     def _infer_roles_from_mode(self) -> None:
         if not self.last_mode:
             return
+        if self.attacker is not None and self.defender is not None:
+            return
         attacker_candidates = [pid for pid, value in self.last_mode.items() if value < 8]
         defender_candidates = [pid for pid, value in self.last_mode.items() if value >= 8]
         if attacker_candidates:
