@@ -1,0 +1,438 @@
+"""Live Durak tracker that mirrors real games from network events."""
+
+from __future__ import annotations
+
+import json
+import time
+from dataclasses import dataclass
+from types import SimpleNamespace
+from typing import Dict, List, Optional, Tuple
+
+import torch
+
+from douzero.dmc.models import Model
+from douzero.env.env import (
+    ACTION_END_ATTACK,
+    ACTION_TAKE_CARDS,
+    MAX_ATTACK_CARDS,
+    NUM_CARDS,
+    DurakState,
+    build_observation,
+    card_suit,
+)
+
+from .cards import card_id_to_symbol, symbol_to_card_id
+
+
+@dataclass
+class LiveGameEvent:
+    """Container for a decoded network message."""
+
+    tag: str
+    payload: Dict
+
+
+class LiveDurakTracker:
+    """Track a remote Durak game and produce DurakZero recommendations."""
+
+    def __init__(
+        self,
+        model: Model,
+        device: torch.device,
+        player_id: Optional[int] = None,
+        verbose: bool = True,
+    ) -> None:
+        self.model = model
+        self.device = device
+        self.player_id = player_id
+        self.verbose = verbose
+        self.flags = SimpleNamespace(exp_epsilon=0.0)
+        self.reset()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def reset(self) -> None:
+        self.game_id: Optional[int] = None
+        self.game_active = False
+        self.table: List[Tuple[int, Optional[int]]] = []
+        self.my_hand: List[int] = []
+        self.discard_cards: List[int] = []
+        self.talon_count: int = 0
+        self.trump_card: Optional[int] = None
+        self.trump_suit: Optional[int] = None
+        self.attacker: Optional[int] = None
+        self.defender: Optional[int] = None
+        self.defender_taking: bool = False
+        self.pending_take_cards: List[int] = []
+        self.last_round_winner: Optional[int] = None
+        self.last_mode: Optional[Dict] = None
+        self.seen_cards: set[int] = set()
+        self.pending_cleanup: Optional[str] = None
+        self._last_recommendation_key: Optional[Tuple] = None
+        self._last_summary_timestamp: float = 0.0
+
+    def process_raw_line(self, raw_line: str) -> None:
+        event = self._parse_line(raw_line)
+        if event is None:
+            return
+        handler = getattr(self, f"_handle_{event.tag}", None)
+        if handler is not None:
+            handler(event.payload)
+            self._update_phase_after_event()
+            self._maybe_recommend()
+
+    # ------------------------------------------------------------------
+    # Parsing helpers
+    # ------------------------------------------------------------------
+
+    def _parse_line(self, raw_line: str) -> Optional[LiveGameEvent]:
+        raw_line = raw_line.strip()
+        if not raw_line:
+            return None
+        if raw_line.startswith("//"):
+            return None
+        if "{" in raw_line:
+            tag, rest = raw_line.split("{", 1)
+            json_payload = "{" + rest
+            try:
+                payload = json.loads(json_payload)
+            except json.JSONDecodeError:
+                return None
+            return LiveGameEvent(tag.strip(), payload)
+        return LiveGameEvent(raw_line, {})
+
+    # ------------------------------------------------------------------
+    # Event handlers
+    # ------------------------------------------------------------------
+
+    def _handle_game(self, payload: Dict) -> None:
+        self.reset()
+        self.game_active = True
+        self.game_id = payload.get("id")
+        if self.player_id is None:
+            self.player_id = payload.get("position", 0)
+        self.seen_cards.clear()
+        if self.verbose:
+            print(f"\n>>> Joined game {self.game_id} as player {self.player_id}")
+
+    def _handle_game_start(self, payload: Dict) -> None:  # noqa: D401 - alias
+        self._handle_game(payload)
+
+    def _handle_game_reset(self, payload: Dict) -> None:
+        if self.verbose:
+            print("Game reset.")
+        self.reset()
+
+    def _handle_game_over(self, payload: Dict) -> None:
+        if self.verbose:
+            winner_list = payload.get("players", [])
+            print(f"Game over. Winner ids: {winner_list}")
+        self.game_active = False
+        self.pending_cleanup = None
+
+    def _handle_win(self, payload: Dict) -> None:
+        if self.verbose:
+            print(f"Win update: {payload}")
+
+    def _handle_hand(self, payload: Dict) -> None:
+        cards = [symbol_to_card_id(card) for card in payload.get("cards", [])]
+        self.my_hand = sorted(card for card in cards if card is not None)
+        self.seen_cards.update(self.my_hand)
+        if self.verbose:
+            formatted = " ".join(card_id_to_symbol(card) for card in self.my_hand)
+            print(f"Updated hand ({len(self.my_hand)}): {formatted}")
+
+    def _handle_turn(self, payload: Dict) -> None:
+        self.talon_count = int(payload.get("deck", self.talon_count))
+        trump_symbol = payload.get("trump")
+        if trump_symbol:
+            trump_id = symbol_to_card_id(trump_symbol)
+            if trump_id is not None:
+                self.trump_card = trump_id
+                self.trump_suit = card_suit(trump_id)
+                self.seen_cards.add(trump_id)
+            else:
+                suit_symbol = trump_symbol[0]
+                suit_idx = symbol_to_card_id(f"6{suit_symbol}")
+                if suit_idx is not None:
+                    self.trump_suit = card_suit(suit_idx)
+
+    def _handle_mode(self, payload: Dict) -> None:
+        self.last_mode = payload
+
+    def _handle_t(self, payload: Dict) -> None:
+        card = symbol_to_card_id(payload.get("c", ""))
+        if card is None:
+            return
+        attacker = payload.get("id")
+        if attacker is None:
+            if card in self.my_hand:
+                attacker = self.player_id
+            elif self.attacker is not None:
+                attacker = self.attacker
+            else:
+                attacker = 1 - (self.player_id or 0)
+        self.attacker = attacker
+        self.defender = 1 - attacker
+        if attacker == self.player_id and card in self.my_hand:
+            self.my_hand.remove(card)
+        self.table.append((card, None))
+        self.seen_cards.add(card)
+        self.pending_cleanup = None
+
+    def _handle_b(self, payload: Dict) -> None:
+        attack_card = symbol_to_card_id(payload.get("c", ""))
+        defense_card = symbol_to_card_id(payload.get("b", ""))
+        if defense_card is None:
+            return
+        pair_index = payload.get("id")
+        if pair_index is None:
+            pair_index = self._find_uncovered_index(attack_card)
+        if pair_index is None or pair_index >= len(self.table):
+            return
+        attack_value, _ = self.table[pair_index]
+        if attack_card is not None and attack_card != attack_value:
+            pair_index = self._find_uncovered_index(attack_card)
+            if pair_index is None:
+                return
+        self.table[pair_index] = (self.table[pair_index][0], defense_card)
+        if self.defender == self.player_id and defense_card in self.my_hand:
+            self.my_hand.remove(defense_card)
+        self.seen_cards.add(defense_card)
+
+    def _handle_take(self, payload: Dict) -> None:
+        self.defender_taking = True
+        self.pending_take_cards = []
+        for attack_card, defense_card in self.table:
+            self.pending_take_cards.append(attack_card)
+            if defense_card is not None:
+                self.pending_take_cards.append(defense_card)
+        self.pending_cleanup = "take"
+
+    def _handle_done(self, payload: Dict) -> None:
+        self.pending_cleanup = "defense"
+
+    def _handle_pass(self, payload: Dict) -> None:
+        # Optional message from the server when the attacker declines to add more cards.
+        self.pending_cleanup = self.pending_cleanup or "defense"
+
+    def _handle_end_turn(self, payload: Dict) -> None:
+        self._finalize_round()
+        next_attacker = payload.get("id")
+        if next_attacker is not None:
+            self.attacker = next_attacker
+            self.defender = 1 - next_attacker
+
+    def _handle_order(self, payload: Dict) -> None:  # pragma: no cover - informational
+        pass
+
+    def _handle_turn_timeout(self, payload: Dict) -> None:  # pragma: no cover
+        pass
+
+    # ------------------------------------------------------------------
+    # Internal bookkeeping
+    # ------------------------------------------------------------------
+
+    def _find_uncovered_index(self, attack_card: Optional[int]) -> Optional[int]:
+        if attack_card is None:
+            for idx, (_, defense) in enumerate(self.table):
+                if defense is None:
+                    return idx
+            return None
+        for idx, (attack, defense) in enumerate(self.table):
+            if attack == attack_card and defense is None:
+                return idx
+        return None
+
+    def _finalize_round(self) -> None:
+        if self.defender_taking:
+            if self.defender == self.player_id:
+                self.my_hand.extend(self.pending_take_cards)
+                self.my_hand.sort()
+            self.defender_taking = False
+            self.pending_take_cards = []
+            self.pending_cleanup = None
+            self.table.clear()
+            return
+
+        if self.table:
+            for attack_card, defense_card in self.table:
+                self.discard_cards.append(attack_card)
+                self.seen_cards.add(attack_card)
+                if defense_card is not None:
+                    self.discard_cards.append(defense_card)
+                    self.seen_cards.add(defense_card)
+        prev_attacker, prev_defender = self.attacker, self.defender
+        self.table.clear()
+        self.pending_cleanup = None
+        if prev_attacker is not None and prev_defender is not None:
+            self.attacker = prev_defender
+            self.defender = prev_attacker
+            self.last_round_winner = self.attacker
+
+    def _update_phase_after_event(self) -> None:
+        if not self.table:
+            return
+        if any(defense is None for _, defense in self.table) and not self.defender_taking:
+            # Defender still owes at least one response.
+            return
+        # Otherwise it is attacker's decision space.
+
+    # ------------------------------------------------------------------
+    # Recommendation logic
+    # ------------------------------------------------------------------
+
+    def _maybe_recommend(self) -> None:
+        if not self.game_active:
+            return
+        if self.player_id is None:
+            return
+        if self.trump_card is None:
+            return
+        if self.attacker is None or self.defender is None:
+            return
+        state = self._build_state()
+        if state is None:
+            return
+        player_turn = state.attacker if state.phase == "attack" else state.defender
+        if player_turn != self.player_id:
+            return
+        key = self._recommendation_key(state)
+        if key == self._last_recommendation_key:
+            return
+        self._last_recommendation_key = key
+        self._emit_recommendation(state)
+
+    def _recommendation_key(self, state: DurakState) -> Tuple:
+        table_key = tuple((atk, defn if defn is not None else -1) for atk, defn in state.table)
+        return (
+            state.phase,
+            tuple(state.hands[self.player_id]),
+            table_key,
+            state.defender_taking,
+            len(state.talon),
+        )
+
+    def _build_state(self) -> Optional[DurakState]:
+        if self.attacker is None or self.defender is None or self.trump_card is None or self.trump_suit is None:
+            return None
+        table = [(atk, defense) for atk, defense in self.table]
+        seen = set(self.seen_cards)
+        for atk, defense in table:
+            seen.add(atk)
+            if defense is not None:
+                seen.add(defense)
+        seen.update(self.my_hand)
+        seen.add(self.trump_card)
+
+        talon = [None] * self.talon_count
+        hands: List[List[Optional[int]]] = [[], []]
+        hands[self.player_id] = sorted(self.my_hand)
+        opponent = 1 - self.player_id
+        opponent_count = self._estimate_opponent_count()
+        hands[opponent] = [None] * opponent_count
+
+        defender_hand_len = len(hands[self.defender]) if self.defender == opponent else len(self.my_hand)
+        round_limit = min(MAX_ATTACK_CARDS, max(1, defender_hand_len))
+        post_take = 0
+        if self.defender_taking:
+            post_take = max(0, min(MAX_ATTACK_CARDS - len(table), defender_hand_len))
+
+        state = DurakState(
+            hands=hands,  # type: ignore[arg-type]
+            talon=talon,  # type: ignore[list-item]
+            discard=list(self.discard_cards),
+            table=table,
+            attacker=self.attacker,
+            defender=self.defender,
+            phase="defense" if self._defender_needs_to_act() else "attack",
+            trump_suit=self.trump_suit,
+            trump_card=self.trump_card,
+            seen_cards=seen,
+            round_attack_limit=round_limit,
+            terminal=False,
+            winner=None,
+            last_round_winner=self.last_round_winner,
+            defender_taking=self.defender_taking,
+            post_take_additions_remaining=post_take,
+        )
+        return state
+
+    def _defender_needs_to_act(self) -> bool:
+        if self.defender_taking:
+            return False
+        return any(defense is None for _, defense in self.table)
+
+    def _estimate_opponent_count(self) -> int:
+        deck = self.talon_count
+        discard = len(self.discard_cards)
+        table_count = 0
+        for attack, defense in self.table:
+            table_count += 1
+            if defense is not None:
+                table_count += 1
+        total_known = len(self.my_hand) + discard + deck + table_count
+        remaining = NUM_CARDS - total_known
+        return max(0, remaining)
+
+    def _emit_recommendation(self, state: DurakState) -> None:
+        obs = build_observation(state, player=self.player_id)
+        state_tensor = torch.from_numpy(obs["state"]).to(self.device)
+        action_embeddings = torch.from_numpy(obs["action_embeddings"]).to(self.device)
+        legal_actions = obs["legal_actions"]
+        position = obs["position"]
+
+        with torch.no_grad():
+            output = self.model.act(position, state_tensor, action_embeddings, flags=self.flags)
+        values = output["values"].cpu().numpy()
+        action_index = output["action_index"]
+        suggestions = list(zip(legal_actions, values))
+        suggestions.sort(key=lambda item: item[1], reverse=True)
+
+        if not self.verbose:
+            return
+
+        now = time.time()
+        if now - self._last_summary_timestamp > 0.2:
+            self._print_state_summary(state)
+            self._last_summary_timestamp = now
+
+        print("Top recommendations:")
+        for idx, (action_id, value) in enumerate(suggestions[:5], start=1):
+            label = self._action_to_text(action_id)
+            marker = "*" if action_id == legal_actions[action_index] else " "
+            print(f"  {marker} #{idx}: {label:<12s} | Q = {value: .3f}")
+        print("-")
+
+    def _print_state_summary(self, state: DurakState) -> None:
+        trump_symbol = card_id_to_symbol(self.trump_card) if self.trump_card is not None else "?"
+        table_strings = []
+        for attack, defense in self.table:
+            attack_symbol = card_id_to_symbol(attack)
+            if defense is None:
+                table_strings.append(f"{attack_symbol}")
+            else:
+                table_strings.append(f"{attack_symbol}/{card_id_to_symbol(defense)}")
+        table_repr = " ".join(table_strings) if table_strings else "(empty)"
+        hand_repr = " ".join(card_id_to_symbol(card) for card in sorted(self.my_hand))
+        print("""------------------------------------------------------------""")
+        print(
+            f"Phase: {state.phase} | Attacker: P{self.attacker} | Defender: P{self.defender}"
+        )
+        print(f"Table: {table_repr}")
+        print(
+            f"Talon remaining: {self.talon_count} | Discarded: {len(self.discard_cards)} | Trump: {trump_symbol}"
+        )
+        print(f"Your hand ({len(self.my_hand)}): {hand_repr}")
+
+    def _action_to_text(self, action_id: int) -> str:
+        if action_id == ACTION_END_ATTACK:
+            return "End attack"
+        if action_id == ACTION_TAKE_CARDS:
+            return "Take cards"
+        return card_id_to_symbol(action_id)
+
+
+__all__ = ["LiveDurakTracker", "LiveGameEvent"]

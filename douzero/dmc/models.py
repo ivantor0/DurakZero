@@ -1,115 +1,66 @@
-"""
-This file includes the torch models. We wrap the three
-models into one class for convenience.
-"""
+"""Models for Durak Deep Monte Carlo training."""
 
 import numpy as np
-
 import torch
 from torch import nn
+import torch.nn.functional as F
 
-class LandlordLstmModel(nn.Module):
+from douzero.env.env import ACTION_VECTOR_LENGTH, STATE_VECTOR_LENGTH
+
+
+class DurakQNetwork(nn.Module):
     def __init__(self):
         super().__init__()
-        self.lstm = nn.LSTM(162, 128, batch_first=True)
-        self.dense1 = nn.Linear(373 + 128, 512)
-        self.dense2 = nn.Linear(512, 512)
-        self.dense3 = nn.Linear(512, 512)
-        self.dense4 = nn.Linear(512, 512)
-        self.dense5 = nn.Linear(512, 512)
-        self.dense6 = nn.Linear(512, 1)
+        input_dim = STATE_VECTOR_LENGTH + ACTION_VECTOR_LENGTH
+        hidden = 256
+        self.fc1 = nn.Linear(input_dim, hidden)
+        self.fc2 = nn.Linear(hidden, hidden)
+        self.fc3 = nn.Linear(hidden, 1)
 
-    def forward(self, z, x, return_value=False, flags=None):
-        lstm_out, (h_n, _) = self.lstm(z)
-        lstm_out = lstm_out[:,-1,:]
-        x = torch.cat([lstm_out,x], dim=-1)
-        x = self.dense1(x)
-        x = torch.relu(x)
-        x = self.dense2(x)
-        x = torch.relu(x)
-        x = self.dense3(x)
-        x = torch.relu(x)
-        x = self.dense4(x)
-        x = torch.relu(x)
-        x = self.dense5(x)
-        x = torch.relu(x)
-        x = self.dense6(x)
-        if return_value:
-            return dict(values=x)
-        else:
-            if flags is not None and flags.exp_epsilon > 0 and np.random.rand() < flags.exp_epsilon:
-                action = torch.randint(x.shape[0], (1,))[0]
-            else:
-                action = torch.argmax(x,dim=0)[0]
-            return dict(action=action)
+    def forward(self, inputs):
+        x = F.relu(self.fc1(inputs))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
 
-class FarmerLstmModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.lstm = nn.LSTM(162, 128, batch_first=True)
-        self.dense1 = nn.Linear(484 + 128, 512)
-        self.dense2 = nn.Linear(512, 512)
-        self.dense3 = nn.Linear(512, 512)
-        self.dense4 = nn.Linear(512, 512)
-        self.dense5 = nn.Linear(512, 512)
-        self.dense6 = nn.Linear(512, 1)
-
-    def forward(self, z, x, return_value=False, flags=None):
-        lstm_out, (h_n, _) = self.lstm(z)
-        lstm_out = lstm_out[:,-1,:]
-        x = torch.cat([lstm_out,x], dim=-1)
-        x = self.dense1(x)
-        x = torch.relu(x)
-        x = self.dense2(x)
-        x = torch.relu(x)
-        x = self.dense3(x)
-        x = torch.relu(x)
-        x = self.dense4(x)
-        x = torch.relu(x)
-        x = self.dense5(x)
-        x = torch.relu(x)
-        x = self.dense6(x)
-        if return_value:
-            return dict(values=x)
-        else:
-            if flags is not None and flags.exp_epsilon > 0 and np.random.rand() < flags.exp_epsilon:
-                action = torch.randint(x.shape[0], (1,))[0]
-            else:
-                action = torch.argmax(x,dim=0)[0]
-            return dict(action=action)
-
-# Model dict is only used in evaluation but not training
-model_dict = {}
-model_dict['landlord'] = LandlordLstmModel
-model_dict['landlord_up'] = FarmerLstmModel
-model_dict['landlord_down'] = FarmerLstmModel
 
 class Model:
-    """
-    The wrapper for the three models. We also wrap several
-    interfaces such as share_memory, eval, etc.
-    """
     def __init__(self, device=0):
-        self.models = {}
         if not device == "cpu":
-            device = 'cuda:' + str(device)
-        self.models['landlord'] = LandlordLstmModel().to(torch.device(device))
-        self.models['landlord_up'] = FarmerLstmModel().to(torch.device(device))
-        self.models['landlord_down'] = FarmerLstmModel().to(torch.device(device))
+            device = "cuda:" + str(device)
+        device = torch.device(device)
+        self.models = {
+            "player_0": DurakQNetwork().to(device),
+            "player_1": DurakQNetwork().to(device),
+        }
 
-    def forward(self, position, z, x, training=False, flags=None):
+    def act(self, position, state, action_embeddings, flags=None):
         model = self.models[position]
-        return model.forward(z, x, training, flags)
+        num_actions = action_embeddings.shape[0]
+        state_expanded = state.unsqueeze(0).expand(num_actions, -1)
+        inputs = torch.cat([state_expanded, action_embeddings], dim=-1)
+        values = model(inputs).squeeze(-1)
+        if flags is not None and flags.exp_epsilon > 0 and np.random.rand() < flags.exp_epsilon:
+            action_index = torch.randint(num_actions, (1,), device=values.device)[0]
+        else:
+            action_index = torch.argmax(values)
+        return {
+            "action_index": int(action_index.item()),
+            "values": values.detach(),
+        }
+
+    def evaluate(self, position, states, actions):
+        model = self.models[position]
+        inputs = torch.cat([states, actions], dim=-1)
+        return model(inputs)
 
     def share_memory(self):
-        self.models['landlord'].share_memory()
-        self.models['landlord_up'].share_memory()
-        self.models['landlord_down'].share_memory()
+        for model in self.models.values():
+            model.share_memory()
 
     def eval(self):
-        self.models['landlord'].eval()
-        self.models['landlord_up'].eval()
-        self.models['landlord_down'].eval()
+        for model in self.models.values():
+            model.eval()
 
     def parameters(self, position):
         return self.models[position].parameters()

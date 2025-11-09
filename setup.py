@@ -10,16 +10,15 @@ setuptools.setup(
     version=VERSION,
     author="Daochen Zha",
     author_email="daochen.zha@tamu.edu",
-    description="DouZero DouDizhu AI",
+    description="DurakZero Durak AI",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/kwai/DouZero",
     license='Apache License 2.0',
-    keywords=["DouDizhu", "AI", "Reinforcment Learning", "RL", "Torch", "Poker"],
+    keywords=["Durak", "AI", "Reinforcement Learning", "RL", "Torch"],
     packages=setuptools.find_packages(),
     install_requires=[
-        'torch',
-        'rlcard'
+        'torch'
     ],
     requires_python='>=3.6',
     classifiers=[
