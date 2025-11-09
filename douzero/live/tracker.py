@@ -196,6 +196,7 @@ class LiveDurakTracker:
                 if suit_idx is not None:
                     self.trump_suit = card_suit(suit_idx)
         self._mark_state_dirty()
+        self._schedule_recommendation()
 
     def _handle_mode(self, payload: Dict) -> None:
         parsed: Dict[int, int] = {}
@@ -261,15 +262,18 @@ class LiveDurakTracker:
         self.pending_cleanup = "take"
         self._log("[event] defender announced take")
         self._mark_state_dirty()
+        self._schedule_recommendation()
 
     def _handle_done(self, payload: Dict) -> None:
         self.pending_cleanup = "defense"
         self._mark_state_dirty()
+        self._schedule_recommendation()
 
     def _handle_pass(self, payload: Dict) -> None:
         # Optional message from the server when the attacker declines to add more cards.
         self.pending_cleanup = self.pending_cleanup or "defense"
         self._mark_state_dirty()
+        self._schedule_recommendation()
 
     def _handle_end_turn(self, payload: Dict) -> None:
         self._finalize_round()
@@ -279,6 +283,7 @@ class LiveDurakTracker:
             self.defender = 1 - next_attacker
         self._log(f"[event] end_turn -> next attacker: {self.attacker}")
         self._mark_state_dirty()
+        self._schedule_recommendation()
 
     def _handle_order(self, payload: Dict) -> None:  # pragma: no cover - informational
         pass
@@ -448,6 +453,10 @@ class LiveDurakTracker:
         action_index = output["action_index"]
         suggestions = list(zip(legal_actions, values))
         suggestions.sort(key=lambda item: item[1], reverse=True)
+
+        if not suggestions:
+            self._log("[recommendation] no legal actions available")
+            return
 
         best_action_id, best_value = suggestions[0]
         best_label = self._action_to_text(best_action_id)
