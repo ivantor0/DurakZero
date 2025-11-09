@@ -84,6 +84,7 @@ class LiveDurakTracker:
         self._role_prompted: bool = False
         self._initial_role: Optional[str] = None
         self._state_dirty: bool = True
+        self._force_recommend: bool = False
 
     def process_raw_line(self, raw_line: str) -> None:
         event = self._parse_line(raw_line)
@@ -94,7 +95,9 @@ class LiveDurakTracker:
             handler(event.payload)
         self._log_raw_line(raw_line)
         self._update_phase_after_event()
-        self._maybe_recommend()
+        force = self._force_recommend
+        self._force_recommend = False
+        self._maybe_recommend(force=force)
 
     # ------------------------------------------------------------------
     # Parsing helpers
@@ -176,6 +179,7 @@ class LiveDurakTracker:
         if self.game_active and not self._role_prompted and self.player_id is not None:
             self._prompt_initial_role()
         self._mark_state_dirty()
+        self._schedule_recommendation()
 
     def _handle_turn(self, payload: Dict) -> None:
         self.talon_count = int(payload.get("deck", self.talon_count))
@@ -223,6 +227,7 @@ class LiveDurakTracker:
         self.seen_cards.add(card)
         self.pending_cleanup = None
         self._mark_state_dirty()
+        self._schedule_recommendation()
 
     def _handle_b(self, payload: Dict) -> None:
         attack_card = symbol_to_card_id(payload.get("c", ""))
@@ -244,6 +249,7 @@ class LiveDurakTracker:
             self.my_hand.remove(defense_card)
         self.seen_cards.add(defense_card)
         self._mark_state_dirty()
+        self._schedule_recommendation()
 
     def _handle_take(self, payload: Dict) -> None:
         self.defender_taking = True
@@ -338,7 +344,7 @@ class LiveDurakTracker:
     # Recommendation logic
     # ------------------------------------------------------------------
 
-    def _maybe_recommend(self) -> None:
+    def _maybe_recommend(self, *, force: bool = False) -> None:
         if not self.game_active:
             return
         if self.player_id is None:
@@ -354,7 +360,7 @@ class LiveDurakTracker:
         if player_turn != self.player_id:
             return
         key = self._recommendation_key(state)
-        if key == self._last_recommendation_key:
+        if not force and key == self._last_recommendation_key:
             if not self._state_dirty:
                 return
         self._state_dirty = False
@@ -580,6 +586,9 @@ class LiveDurakTracker:
     def _mark_state_dirty(self) -> None:
         self._state_dirty = True
         self._last_recommendation_key = None
+
+    def _schedule_recommendation(self) -> None:
+        self._force_recommend = True
 
 
 __all__ = ["LiveDurakTracker", "LiveGameEvent"]
