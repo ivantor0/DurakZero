@@ -81,6 +81,8 @@ class LiveDurakTracker:
         self.pending_cleanup: Optional[str] = None
         self._last_recommendation_key: Optional[Tuple] = None
         self._last_summary_timestamp: float = 0.0
+        self._role_prompted: bool = False
+        self._initial_role: Optional[str] = None
 
     def process_raw_line(self, raw_line: str) -> None:
         event = self._parse_line(raw_line)
@@ -118,12 +120,26 @@ class LiveDurakTracker:
     # ------------------------------------------------------------------
 
     def _handle_game(self, payload: Dict) -> None:
+        incoming_id = payload.get("id")
+        incoming_position = payload.get("position")
+
+        if incoming_id is None and self.game_id is not None:
+            self.game_active = True
+            if self.player_id is None and incoming_position is not None:
+                self.player_id = incoming_position
+            if self.verbose:
+                print(
+                    f"\n>>> Joined game None as player {self.player_id}"
+                    f" (continuing {self.game_id})"
+                )
+            self._log("# Received null game id; continuing current game context")
+            return
+
         self.reset()
         self.game_active = True
-        self.game_id = payload.get("id")
+        self.game_id = incoming_id
         if self.player_id is None:
-            self.player_id = payload.get("position", 0)
-        self.seen_cards.clear()
+            self.player_id = incoming_position if incoming_position is not None else 0
         self._open_log_file()
         if self.verbose:
             print(f"\n>>> Joined game {self.game_id} as player {self.player_id}")
@@ -156,6 +172,8 @@ class LiveDurakTracker:
         if self.verbose:
             formatted = " ".join(card_id_to_symbol(card) for card in self.my_hand)
             print(f"Updated hand ({len(self.my_hand)}): {formatted}")
+        if self.game_active and not self._role_prompted and self.player_id is not None:
+            self._prompt_initial_role()
 
     def _handle_turn(self, payload: Dict) -> None:
         self.talon_count = int(payload.get("deck", self.talon_count))
@@ -369,7 +387,7 @@ class LiveDurakTracker:
         state = DurakState(
             hands=hands,  # type: ignore[arg-type]
             talon=talon,  # type: ignore[list-item]
-        discard=list(self.discard_cards),
+            discard=list(self.discard_cards),
             table=table,
             attacker=self.attacker,
             defender=self.defender,
@@ -499,6 +517,31 @@ class LiveDurakTracker:
         timestamp = time.strftime("%H:%M:%S", time.localtime())
         self._log_handle.write(f"[{timestamp}] {message}\n")
         self._log_handle.flush()
+
+    def _prompt_initial_role(self) -> None:
+        if self._role_prompted:
+            return
+        prompt = "Are you a defender [D] or an attacker [A]? Default: attacker > "
+        try:
+            choice = input(prompt)
+        except EOFError:
+            choice = ""
+        answer = (choice or "").strip().lower()
+        defender_selected = answer.startswith("d")
+        self._role_prompted = True
+        default_player = self.player_id if self.player_id is not None else 0
+        if defender_selected:
+            self.defender = default_player
+            self.attacker = 1 - default_player
+            role_text = "defender"
+        else:
+            self.attacker = default_player
+            self.defender = 1 - default_player
+            role_text = "attacker"
+        self._initial_role = role_text
+        if self.verbose:
+            print(f"Assuming you start as {role_text}.")
+        self._log(f"[role] user selected {role_text}")
 
     def _infer_roles_from_mode(self) -> None:
         if not self.last_mode:
