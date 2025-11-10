@@ -4,13 +4,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-CHECKPOINT_PATH=${CHECKPOINT_PATH:-${PROJECT_ROOT}/model.tar}
+CHECKPOINT_PATH=${CHECKPOINT_PATH:-${PROJECT_ROOT}/durakzero_checkpoints/vastai_run/model.tar}
 DEVICE=${DEVICE:-cpu}
 PLAYER_ID=${PLAYER_ID:-}
-LOG_DIR=${LOG_DIR:-${PROJECT_ROOT}/durak_live_logs}
+LOG_DIR=${LOG_DIR:-${PROJECT_ROOT}/game_logs}
 SOURCE=${SOURCE:-pyshark}
 INTERFACE=${INTERFACE:-waydroid0}
-IP_FILTER=${IP_FILTER:-}
+IP_FILTER=${IP_FILTER:-ip.addr == 186.2.174.22}
 LOG_FILE=${LOG_FILE:-}
 
 ARGS=("--checkpoint" "${CHECKPOINT_PATH}" "--device" "${DEVICE}" "--source" "${SOURCE}")
@@ -43,4 +43,4 @@ case "${SOURCE}" in
     ;;
  esac
 
-exec python "${SCRIPT_DIR}/durak_live_helper.py" "${ARGS[@]}"
+exec /home/ivan/miniconda3/envs/neurodurak/bin/python "../durak_live_helper.py" "${ARGS[@]}"
