@@ -85,6 +85,7 @@ class LiveDurakTracker:
         self._initial_role: Optional[str] = None
         self._state_dirty: bool = True
         self._force_recommend: bool = False
+        self._round_attack_limit: Optional[int] = None
 
     def process_raw_line(self, raw_line: str) -> None:
         event = self._parse_line(raw_line)
@@ -220,8 +221,11 @@ class LiveDurakTracker:
                 attacker = self.attacker
             else:
                 attacker = 1 - (self.player_id or 0)
+        starting_new_round = not self.table
         self.attacker = attacker
         self.defender = 1 - attacker
+        if starting_new_round:
+            self._round_attack_limit = self._compute_round_attack_limit(self.defender)
         if attacker == self.player_id and card in self.my_hand:
             self.my_hand.remove(card)
         self.table.append((card, None))
@@ -235,7 +239,25 @@ class LiveDurakTracker:
         defense_card = symbol_to_card_id(payload.get("b", ""))
         if defense_card is None:
             return
-        pair_index = payload.get("id")
+        raw_index = payload.get("id")
+        pair_index: Optional[int]
+        if raw_index is not None:
+            try:
+                pair_index = int(raw_index)
+            except (TypeError, ValueError):
+                pair_index = None
+            else:
+                if pair_index < 0:
+                    pair_index = None
+                elif pair_index >= len(self.table):
+                    candidate = pair_index - 1
+                    if 0 <= candidate < len(self.table):
+                        pair_index = candidate
+                    else:
+                        pair_index = None
+        else:
+            pair_index = None
+
         if pair_index is None:
             pair_index = self._find_uncovered_index(attack_card)
         if pair_index is None or pair_index >= len(self.table):
@@ -315,6 +337,7 @@ class LiveDurakTracker:
             self.pending_take_cards = []
             self.pending_cleanup = None
             self.table.clear()
+            self._round_attack_limit = None
             self._log("[round] defender took the table")
             return
 
@@ -330,6 +353,7 @@ class LiveDurakTracker:
         prev_attacker, prev_defender = self.attacker, self.defender
         self.table.clear()
         self.pending_cleanup = None
+        self._round_attack_limit = None
         if prev_attacker is not None and prev_defender is not None:
             self.attacker = prev_defender
             self.defender = prev_attacker
@@ -402,7 +426,11 @@ class LiveDurakTracker:
         hands[opponent] = [None] * opponent_count
 
         defender_hand_len = len(hands[self.defender]) if self.defender == opponent else len(self.my_hand)
-        round_limit = min(MAX_ATTACK_CARDS, max(1, defender_hand_len))
+        if self._round_attack_limit is None:
+            round_limit = min(MAX_ATTACK_CARDS, max(1, defender_hand_len))
+        else:
+            round_limit = self._round_attack_limit
+        round_limit = max(len(table), round_limit)
         post_take = 0
         if self.defender_taking:
             post_take = max(0, min(MAX_ATTACK_CARDS - len(table), defender_hand_len))
@@ -431,6 +459,13 @@ class LiveDurakTracker:
         if self.defender_taking:
             return False
         return any(defense is None for _, defense in self.table)
+
+    def _compute_round_attack_limit(self, defender: int) -> int:
+        if defender == self.player_id:
+            defender_hand_len = len(self.my_hand)
+        else:
+            defender_hand_len = self._estimate_opponent_count()
+        return min(MAX_ATTACK_CARDS, max(1, defender_hand_len))
 
     def _estimate_opponent_count(self) -> int:
         discard_total = len(self._discard_cache)
