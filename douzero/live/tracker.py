@@ -226,14 +226,38 @@ class LiveDurakTracker:
         card = symbol_to_card_id(payload.get("c", ""))
         if card is None:
             return
-        attacker = payload.get("id")
+
+        raw_attacker = payload.get("id")
+        attacker: Optional[int]
+        if raw_attacker is None:
+            attacker = None
+        else:
+            try:
+                attacker = int(raw_attacker)
+            except (TypeError, ValueError):
+                attacker = None
+            else:
+                if attacker < 0 or attacker > 1:
+                    attacker = None
+
+        if (
+            attacker is None
+            and self.player_id is not None
+            and card in self.my_hand
+        ) or (
+            attacker is not None
+            and self.player_id is not None
+            and card in self.my_hand
+            and attacker != self.player_id
+        ):
+            attacker = self.player_id
+
         if attacker is None:
-            if card in self.my_hand:
-                attacker = self.player_id
-            elif self.attacker is not None:
+            if self.attacker is not None:
                 attacker = self.attacker
             else:
                 attacker = 1 - (self.player_id or 0)
+
         starting_new_round = not self.table
         self.attacker = attacker
         self.defender = 1 - attacker
@@ -245,6 +269,8 @@ class LiveDurakTracker:
             self._adjust_opponent_count(-1)
         if attacker == self.player_id and card in self.my_hand:
             self.my_hand.remove(card)
+        if self.defender_taking:
+            self.pending_take_cards.append(card)
         self.table.append((card, None))
         self.seen_cards.add(card)
         self.pending_cleanup = None
