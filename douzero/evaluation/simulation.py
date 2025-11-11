@@ -1,88 +1,86 @@
-import multiprocessing as mp
-import pickle
+"""Evaluation utilities for DurakZero models."""
 
-from douzero.env.game import GameEnv
+from types import SimpleNamespace
+from typing import Optional
 
-def load_card_play_models(card_play_model_path_dict):
-    players = {}
+import torch
 
-    for position in ['landlord', 'landlord_up', 'landlord_down']:
-        if card_play_model_path_dict[position] == 'rlcard':
-            from .rlcard_agent import RLCardAgent
-            players[position] = RLCardAgent(position)
-        elif card_play_model_path_dict[position] == 'random':
-            from .random_agent import RandomAgent
-            players[position] = RandomAgent()
+from douzero.dmc.models import Model
+from douzero.env import Env
+
+
+def load_model(checkpoint_path: str, device: str | int | torch.device = 'cpu') -> Model:
+    if isinstance(device, torch.device):
+        if device.type == 'cpu':
+            model_device: str | int = 'cpu'
+            map_location = 'cpu'
         else:
-            from .deep_agent import DeepAgent
-            players[position] = DeepAgent(position, card_play_model_path_dict[position])
-    return players
+            index = device.index or 0
+            model_device = index
+            map_location = f'cuda:{index}'
+    elif isinstance(device, int):
+        model_device = device
+        map_location = f'cuda:{device}'
+    else:
+        dev_lower = device.lower()
+        if dev_lower.startswith('cpu'):
+            model_device = 'cpu'
+            map_location = 'cpu'
+        elif dev_lower.startswith('cuda'):
+            if ':' in dev_lower:
+                index_str = dev_lower.split(':', 1)[1] or '0'
+            else:
+                index_str = '0'
+            model_device = int(index_str)
+            map_location = f'cuda:{index_str}'
+        elif dev_lower.isdigit():
+            model_device = int(dev_lower)
+            map_location = f'cuda:{dev_lower}'
+        else:
+            model_device = device
+            map_location = 'cpu'
+    model = Model(device=model_device)
+    state = torch.load(checkpoint_path, map_location=map_location)
+    model_state_dict = state.get('model_state_dict', {})
+    for position in ['player_0', 'player_1']:
+        if position in model_state_dict:
+            model.get_model(position).load_state_dict(model_state_dict[position])
+    model.eval()
+    return model
 
-def mp_simulate(card_play_data_list, card_play_model_path_dict, q):
 
-    players = load_card_play_models(card_play_model_path_dict)
+def evaluate(model_path: str, num_games: int = 100, seed: Optional[int] = None) -> dict:
+    device = 'cpu'
+    model = load_model(model_path, device=device)
+    env = Env(seed=seed)
+    wins = {0: 0, 1: 0}
+    flags = SimpleNamespace(exp_epsilon=0.0)
 
-    env = GameEnv(players)
-    for idx, card_play_data in enumerate(card_play_data_list):
-        env.card_play_init(card_play_data)
-        while not env.game_over:
-            env.step()
-        env.reset()
+    for _ in range(num_games):
+        obs = env.reset()
+        done = False
+        while not done:
+            position = obs['position']
+            state = torch.from_numpy(obs['state']).to(device)
+            action_embeddings = torch.from_numpy(obs['action_embeddings']).to(device)
+            with torch.no_grad():
+                agent_output = model.act(position, state, action_embeddings, flags=flags)
+            action_index = agent_output['action_index']
+            action_id = int(obs['legal_actions'][action_index])
+            obs, reward, done, info = env.step(action_id)
+            if done:
+                winner = info.get('winner', 0)
+                if winner is None:
+                    winner = 0
+                wins[winner] += 1
+            else:
+                assert obs is not None
 
-    q.put((env.num_wins['landlord'],
-           env.num_wins['farmer'],
-           env.num_scores['landlord'],
-           env.num_scores['farmer']
-         ))
-
-def data_allocation_per_worker(card_play_data_list, num_workers):
-    card_play_data_list_each_worker = [[] for k in range(num_workers)]
-    for idx, data in enumerate(card_play_data_list):
-        card_play_data_list_each_worker[idx % num_workers].append(data)
-
-    return card_play_data_list_each_worker
-
-def evaluate(landlord, landlord_up, landlord_down, eval_data, num_workers):
-
-    with open(eval_data, 'rb') as f:
-        card_play_data_list = pickle.load(f)
-
-    card_play_data_list_each_worker = data_allocation_per_worker(
-        card_play_data_list, num_workers)
-    del card_play_data_list
-
-    card_play_model_path_dict = {
-        'landlord': landlord,
-        'landlord_up': landlord_up,
-        'landlord_down': landlord_down}
-
-    num_landlord_wins = 0
-    num_farmer_wins = 0
-    num_landlord_scores = 0
-    num_farmer_scores = 0
-
-    ctx = mp.get_context('spawn')
-    q = ctx.SimpleQueue()
-    processes = []
-    for card_paly_data in card_play_data_list_each_worker:
-        p = ctx.Process(
-                target=mp_simulate,
-                args=(card_paly_data, card_play_model_path_dict, q))
-        p.start()
-        processes.append(p)
-
-    for p in processes:
-        p.join()
-
-    for i in range(num_workers):
-        result = q.get()
-        num_landlord_wins += result[0]
-        num_farmer_wins += result[1]
-        num_landlord_scores += result[2]
-        num_farmer_scores += result[3]
-
-    num_total_wins = num_landlord_wins + num_farmer_wins
-    print('WP results:')
-    print('landlord : Farmers - {} : {}'.format(num_landlord_wins / num_total_wins, num_farmer_wins / num_total_wins))
-    print('ADP results:')
-    print('landlord : Farmers - {} : {}'.format(num_landlord_scores / num_total_wins, 2 * num_farmer_scores / num_total_wins)) 
+    env.close()
+    total_games = wins[0] + wins[1]
+    return {
+        'player_0_wins': wins[0],
+        'player_1_wins': wins[1],
+        'player_0_win_rate': wins[0] / total_games if total_games else 0.0,
+        'player_1_win_rate': wins[1] / total_games if total_games else 0.0,
+    }
