@@ -235,7 +235,25 @@ class LiveDurakTracker:
         defense_card = symbol_to_card_id(payload.get("b", ""))
         if defense_card is None:
             return
-        pair_index = payload.get("id")
+        raw_index = payload.get("id")
+        pair_index: Optional[int]
+        if raw_index is not None:
+            try:
+                pair_index = int(raw_index)
+            except (TypeError, ValueError):
+                pair_index = None
+            else:
+                if pair_index < 0:
+                    pair_index = None
+                elif pair_index >= len(self.table):
+                    candidate = pair_index - 1
+                    if 0 <= candidate < len(self.table):
+                        pair_index = candidate
+                    else:
+                        pair_index = None
+        else:
+            pair_index = None
+
         if pair_index is None:
             pair_index = self._find_uncovered_index(attack_card)
         if pair_index is None or pair_index >= len(self.table):
