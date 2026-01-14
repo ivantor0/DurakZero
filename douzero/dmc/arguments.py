@@ -1,14 +1,12 @@
 import argparse
 
-parser = argparse.ArgumentParser(description='DouZero: PyTorch DouDizhu AI')
+parser = argparse.ArgumentParser(description='DurakZero: Deep Monte Carlo Durak AI')
 
 # General Settings
-parser.add_argument('--xpid', default='douzero',
-                    help='Experiment id (default: douzero)')
+parser.add_argument('--xpid', default='durakzero',
+                    help='Experiment id (default: durakzero)')
 parser.add_argument('--save_interval', default=30, type=int,
-                    help='Time interval (in minutes) at which to save the model')    
-parser.add_argument('--objective', default='adp', type=str, choices=['adp', 'wp', 'logadp'],
-                    help='Use ADP or WP as reward (default: ADP)')    
+                    help='Time interval (in minutes) at which to save the model')
 
 # Training settings
 parser.add_argument('--actor_device_cpu', action='store_true',
@@ -25,7 +23,7 @@ parser.add_argument('--load_model', action='store_true',
                     help='Load an existing model')
 parser.add_argument('--disable_checkpoint', action='store_true',
                     help='Disable saving checkpoint')
-parser.add_argument('--savedir', default='douzero_checkpoints',
+parser.add_argument('--savedir', default='durakzero_checkpoints',
                     help='Root dir where experiment data will be saved')
 
 # Hyperparameters

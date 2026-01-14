@@ -1,574 +1,544 @@
-from collections import Counter
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple
+
 import numpy as np
 
-from douzero.env.game import GameEnv
+SUITS = ["clubs", "diamonds", "hearts", "spades"]
+RANKS = ["6", "7", "8", "9", "10", "J", "Q", "K", "A"]
+NUM_PLAYERS = 2
+NUM_CARDS = len(SUITS) * len(RANKS)
+MAX_ATTACK_CARDS = 6
+ACTION_END_ATTACK = 36
+ACTION_TAKE_CARDS = 37
+NUM_ACTIONS = ACTION_TAKE_CARDS + 1
 
-Card2Column = {3: 0, 4: 1, 5: 2, 6: 3, 7: 4, 8: 5, 9: 6, 10: 7,
-               11: 8, 12: 9, 13: 10, 14: 11, 17: 12}
+COUNTS_VECTOR_LENGTH = 12
+STATE_VECTOR_LENGTH = (
+    4 * NUM_CARDS  # player hand, table attack, table defense, seen cards
+    + len(SUITS)
+    + len(RANKS)
+    + 3  # last winner one-hot
+    + 2  # current player one-hot
+    + 2  # attacker one-hot
+    + 2  # defender one-hot
+    + COUNTS_VECTOR_LENGTH
+)
+ACTION_VECTOR_LENGTH = NUM_ACTIONS
 
-NumOnes2Array = {0: np.array([0, 0, 0, 0]),
-                 1: np.array([1, 0, 0, 0]),
-                 2: np.array([1, 1, 0, 0]),
-                 3: np.array([1, 1, 1, 0]),
-                 4: np.array([1, 1, 1, 1])}
 
-deck = []
-for i in range(3, 15):
-    deck.extend([i for _ in range(4)])
-deck.extend([17 for _ in range(4)])
-deck.extend([20, 30])
+@dataclass
+class DurakState:
+    hands: List[List[int]]
+    talon: List[int]
+    discard: List[int]
+    table: List[Tuple[int, Optional[int]]]
+    attacker: int
+    defender: int
+    phase: str  # "attack" or "defense"
+    trump_suit: int
+    trump_card: int
+    seen_cards: set[int] = field(default_factory=set)
+    round_attack_limit: int = MAX_ATTACK_CARDS
+    terminal: bool = False
+    winner: Optional[int] = None
+    last_round_winner: Optional[int] = None
+    defender_taking: bool = False
+    post_take_additions_remaining: int = 0
 
-class Env:
-    """
-    Doudizhu multi-agent wrapper
-    """
-    def __init__(self, objective):
-        """
-        Objective is wp/adp/logadp. It indicates whether considers
-        bomb in reward calculation. Here, we use dummy agents.
-        This is because, in the orignial game, the players
-        are `in` the game. Here, we want to isolate
-        players and environments to have a more gym style
-        interface. To achieve this, we use dummy players
-        to play. For each move, we tell the corresponding
-        dummy player which action to play, then the player
-        will perform the actual action in the game engine.
-        """
-        self.objective = objective
+    def copy(self) -> "DurakState":
+        return DurakState(
+            hands=[hand.copy() for hand in self.hands],
+            talon=self.talon.copy(),
+            discard=self.discard.copy(),
+            table=[(atk, defn) for atk, defn in self.table],
+            attacker=self.attacker,
+            defender=self.defender,
+            phase=self.phase,
+            trump_suit=self.trump_suit,
+            trump_card=self.trump_card,
+            seen_cards=self.seen_cards.copy(),
+            round_attack_limit=self.round_attack_limit,
+            terminal=self.terminal,
+            winner=self.winner,
+            last_round_winner=self.last_round_winner,
+            defender_taking=self.defender_taking,
+            post_take_additions_remaining=self.post_take_additions_remaining,
+        )
 
-        # Initialize players
-        # We use three dummy player for the target position
-        self.players = {}
-        for position in ['landlord', 'landlord_up', 'landlord_down']:
-            self.players[position] = DummyAgent(position)
 
-        # Initialize the internal environment
-        self._env = GameEnv(self.players)
+def card_to_id(card: Tuple[int, int]) -> int:
+    suit, rank = card
+    return suit * len(RANKS) + rank
 
-        self.infoset = None
 
-    def reset(self):
-        """
-        Every time reset is called, the environment
-        will be re-initialized with a new deck of cards.
-        This function is usually called when a game is over.
-        """
-        self._env.reset()
+def id_to_card(card_id: int) -> Tuple[int, int]:
+    suit = card_id // len(RANKS)
+    rank = card_id % len(RANKS)
+    return suit, rank
 
-        # Randomly shuffle the deck
-        _deck = deck.copy()
-        np.random.shuffle(_deck)
-        card_play_data = {'landlord': _deck[:20],
-                          'landlord_up': _deck[20:37],
-                          'landlord_down': _deck[37:54],
-                          'three_landlord_cards': _deck[17:20],
-                          }
-        for key in card_play_data:
-            card_play_data[key].sort()
 
-        # Initialize the cards
-        self._env.card_play_init(card_play_data)
-        self.infoset = self._game_infoset
+def card_suit(card_id: int) -> int:
+    return card_id // len(RANKS)
 
-        return get_obs(self.infoset)
 
-    def step(self, action):
-        """
-        Step function takes as input the action, which
-        is a list of integers, and output the next obervation,
-        reward, and a Boolean variable indicating whether the
-        current game is finished. It also returns an empty
-        dictionary that is reserved to pass useful information.
-        """
-        assert action in self.infoset.legal_actions
-        self.players[self._acting_player_position].set_action(action)
-        self._env.step()
-        self.infoset = self._game_infoset
-        done = False
-        reward = 0.0
-        if self._game_over:
-            done = True
-            reward = self._get_reward()
+def card_rank(card_id: int) -> int:
+    return card_id % len(RANKS)
+
+
+def initial_state(rng: np.random.Generator) -> DurakState:
+    deck = rng.permutation(NUM_CARDS).tolist()
+    hands: List[List[int]] = [[] for _ in range(NUM_PLAYERS)]
+    for _ in range(6):
+        for pid in range(NUM_PLAYERS):
+            hands[pid].append(deck.pop())
+    trump_card = deck.pop()
+    trump_suit = card_suit(trump_card)
+    talon = deck
+    talon.append(trump_card)
+    for hand in hands:
+        hand.sort()
+    attacker = _choose_initial_attacker(hands, trump_suit)
+    defender = 1 - attacker
+    seen_cards = {trump_card}
+    state = DurakState(
+        hands=hands,
+        talon=talon,
+        discard=[],
+        table=[],
+        attacker=attacker,
+        defender=defender,
+        phase="attack",
+        trump_suit=trump_suit,
+        trump_card=trump_card,
+        seen_cards=seen_cards,
+        round_attack_limit=_compute_attack_limit(hands[defender]),
+    )
+    state.last_round_winner = None
+    return state
+
+
+def _choose_initial_attacker(hands: Sequence[Sequence[int]], trump_suit: int) -> int:
+    lowest_trumps: List[Tuple[int, int]] = []
+    for pid, hand in enumerate(hands):
+        trumps = [card for card in hand if card_suit(card) == trump_suit]
+        if trumps:
+            lowest = min(trumps, key=card_rank)
+            lowest_trumps.append((card_rank(lowest), pid))
+    if lowest_trumps:
+        _, pid = min(lowest_trumps)
+        return pid
+    return 0
+
+
+def _compute_attack_limit(defender_hand: Sequence[int]) -> int:
+    return min(MAX_ATTACK_CARDS, max(1, len(defender_hand)))
+
+
+def legal_actions(state: DurakState) -> np.ndarray:
+    mask = np.zeros(NUM_ACTIONS, dtype=np.bool_)
+    if state.terminal:
+        return mask
+    if state.phase == "attack":
+        attacker_hand = state.hands[state.attacker]
+        if state.defender_taking:
+            playable: List[int] = []
+            if (
+                state.post_take_additions_remaining > 0
+                and len(state.table) < MAX_ATTACK_CARDS
+            ):
+                ranks_on_table = _ranks_on_table(state.table)
+                playable = [card for card in attacker_hand if card_rank(card) in ranks_on_table]
+            for card in playable:
+                mask[card] = True
+            mask[ACTION_END_ATTACK] = True
+        elif state.table:
+            if _all_cards_covered(state.table):
+                if len(state.table) < state.round_attack_limit and attacker_hand:
+                    ranks_on_table = _ranks_on_table(state.table)
+                    playable = [card for card in attacker_hand if card_rank(card) in ranks_on_table]
+                else:
+                    playable = []
+                for card in playable:
+                    mask[card] = True
+                if state.table and _all_cards_covered(state.table):
+                    mask[ACTION_END_ATTACK] = True
+            else:
+                pass
+        else:
+            for card in attacker_hand:
+                mask[card] = True
+        mask[ACTION_TAKE_CARDS] = False
+        if not state.table and not attacker_hand:
+            mask[:] = False
+    else:
+        defender_hand = state.hands[state.defender]
+        uncovered = _uncovered_attack_cards(state.table)
+        if uncovered:
+            targets = [atk for _, atk in uncovered]
+            for card in defender_hand:
+                if any(_can_cover(card, atk, state.trump_suit) for atk in targets):
+                    mask[card] = True
+            mask[ACTION_TAKE_CARDS] = True
+        if state.table and not uncovered:
+            mask[:] = False
+        mask[ACTION_END_ATTACK] = False
+    return mask
+
+
+def apply_action(state: DurakState, action: int) -> Tuple[DurakState, bool, Optional[int]]:
+    if state.terminal:
+        return state, True, state.winner
+    if state.phase == "attack":
+        if action == ACTION_END_ATTACK:
+            if state.defender_taking:
+                _finalize_take(state)
+            elif state.table and _all_cards_covered(state.table):
+                _finish_round_with_defense(state)
+            else:
+                raise ValueError("Cannot end attack before defender covers all cards.")
+        else:
+            _play_attack_card(state, action)
+    else:
+        if action == ACTION_TAKE_CARDS:
+            _defender_takes(state)
+        else:
+            _defend_card(state, action)
+    _check_terminal(state)
+    return state, state.terminal, state.winner
+
+
+def _play_attack_card(state: DurakState, card: int) -> None:
+    if card not in state.hands[state.attacker]:
+        raise ValueError("Attacker does not hold this card.")
+    if state.table:
+        if state.defender_taking:
+            if len(state.table) >= MAX_ATTACK_CARDS:
+                raise ValueError("Attack limit reached for this round.")
+            if state.post_take_additions_remaining <= 0:
+                raise ValueError("No additional cards allowed after defender takes.")
+            ranks = _ranks_on_table(state.table)
+            if card_rank(card) not in ranks:
+                raise ValueError("Attack card must match rank already on table.")
+        else:
+            if not _all_cards_covered(state.table):
+                raise ValueError("Cannot add new attack card until defender covers current cards.")
+            if len(state.table) >= state.round_attack_limit:
+                raise ValueError("Attack limit reached for this round.")
+            ranks = _ranks_on_table(state.table)
+            if card_rank(card) not in ranks:
+                raise ValueError("Attack card must match rank already on table.")
+    state.hands[state.attacker].remove(card)
+    state.table.append((card, None))
+    state.seen_cards.add(card)
+    if state.defender_taking:
+        state.post_take_additions_remaining = max(0, state.post_take_additions_remaining - 1)
+        if (
+            state.post_take_additions_remaining == 0
+            or len(state.table) >= MAX_ATTACK_CARDS
+            or not _attacker_has_matching_rank(state)
+        ):
+            _finalize_take(state)
+        return
+    state.phase = "defense"
+
+
+def _defend_card(state: DurakState, card: int) -> None:
+    if card not in state.hands[state.defender]:
+        raise ValueError("Defender does not hold this card.")
+    uncovered = _uncovered_attack_cards(state.table)
+    if not uncovered:
+        raise ValueError("No cards to defend against.")
+    cover_index = None
+    for idx, attack_card in uncovered:
+        if _can_cover(card, attack_card, state.trump_suit):
+            cover_index = idx
+            break
+    if cover_index is None:
+        raise ValueError("Card cannot cover any attack card.")
+    state.hands[state.defender].remove(card)
+    attack_card, _ = state.table[cover_index]
+    state.table[cover_index] = (attack_card, card)
+    state.seen_cards.add(card)
+    if _all_cards_covered(state.table):
+        if (
+            len(state.table) < state.round_attack_limit
+            and state.hands[state.attacker]
+            and state.hands[state.defender]
+            and _attacker_has_matching_rank(state)
+        ):
+            state.phase = "attack"
+        else:
+            _finish_round_with_defense(state)
+    else:
+        state.phase = "defense"
+
+
+def _defender_takes(state: DurakState) -> None:
+    if state.defender_taking:
+        return
+    state.defender_taking = True
+    remaining_slots = max(0, MAX_ATTACK_CARDS - len(state.table))
+    state.post_take_additions_remaining = min(
+        remaining_slots, len(state.hands[state.defender])
+    )
+    state.phase = "attack"
+    if (
+        state.post_take_additions_remaining == 0
+        or len(state.table) >= MAX_ATTACK_CARDS
+        or not _attacker_has_matching_rank(state)
+    ):
+        _finalize_take(state)
+    state.last_round_winner = None
+
+
+def _finish_round_with_defense(state: DurakState) -> None:
+    for attack_card, defense_card in state.table:
+        state.discard.append(attack_card)
+        state.seen_cards.add(attack_card)
+        if defense_card is not None:
+            state.discard.append(defense_card)
+            state.seen_cards.add(defense_card)
+    state.table.clear()
+    old_attacker = state.attacker
+    old_defender = state.defender
+    _refill_hands(state, old_attacker, old_defender)
+    state.attacker = old_defender
+    state.defender = old_attacker
+    state.phase = "attack"
+    state.round_attack_limit = _compute_attack_limit(state.hands[state.defender])
+    state.hands[state.attacker].sort()
+    state.hands[state.defender].sort()
+    state.last_round_winner = state.attacker
+    state.defender_taking = False
+    state.post_take_additions_remaining = 0
+
+
+def _finalize_take(state: DurakState) -> None:
+    for attack_card, defense_card in state.table:
+        state.hands[state.defender].append(attack_card)
+        if defense_card is not None:
+            state.hands[state.defender].append(defense_card)
+    state.hands[state.defender].sort()
+    state.table.clear()
+    _refill_hands(state, state.attacker, state.defender)
+    state.phase = "attack"
+    state.round_attack_limit = _compute_attack_limit(state.hands[state.defender])
+    state.defender_taking = False
+    state.post_take_additions_remaining = 0
+    state.last_round_winner = None
+
+
+def _refill_hands(state: DurakState, first: int, second: int) -> None:
+    for pid in (first, second):
+        while len(state.hands[pid]) < 6 and state.talon:
+            card = state.talon.pop(0)
+            state.hands[pid].append(card)
+        state.hands[pid].sort()
+
+
+def _attacker_has_matching_rank(state: DurakState) -> bool:
+    ranks = _ranks_on_table(state.table)
+    for card in state.hands[state.attacker]:
+        if card_rank(card) in ranks:
+            return True
+    return False
+
+
+def _uncovered_attack_cards(table: Sequence[Tuple[int, Optional[int]]]) -> List[Tuple[int, int]]:
+    return [(idx, atk) for idx, (atk, defense) in enumerate(table) if defense is None]
+
+
+def _all_cards_covered(table: Sequence[Tuple[int, Optional[int]]]) -> bool:
+    return bool(table) and all(defense is not None for _, defense in table)
+
+
+def _can_cover(defense_card: int, attack_card: int, trump_suit: int) -> bool:
+    defense_suit = card_suit(defense_card)
+    attack_suit = card_suit(attack_card)
+    if defense_suit == attack_suit:
+        return card_rank(defense_card) > card_rank(attack_card)
+    if defense_suit == trump_suit and attack_suit != trump_suit:
+        return True
+    return False
+
+
+def _ranks_on_table(table: Sequence[Tuple[int, Optional[int]]]) -> set[int]:
+    ranks = {card_rank(atk) for atk, _ in table}
+    ranks.update(card_rank(defense) for _, defense in table if defense is not None)
+    return ranks
+
+
+def _check_terminal(state: DurakState) -> None:
+    if state.terminal:
+        return
+    if state.table:
+        return
+    if state.talon:
+        return
+    hand_sizes = [len(hand) for hand in state.hands]
+    zero_players = [pid for pid, size in enumerate(hand_sizes) if size == 0]
+    if len(zero_players) == 1:
+        state.terminal = True
+        state.winner = zero_players[0]
+    elif len(zero_players) == 2:
+        winner = state.last_round_winner if state.last_round_winner is not None else state.attacker
+        state.terminal = True
+        state.winner = winner
+
+
+def current_player(state: DurakState) -> int:
+    return state.attacker if state.phase == "attack" else state.defender
+
+
+def discard_seen(state: DurakState) -> np.ndarray:
+    seen = np.zeros(NUM_CARDS, dtype=np.bool_)
+    for card in state.discard:
+        seen[card] = True
+    for attack_card, defense_card in state.table:
+        seen[attack_card] = True
+        if defense_card is not None:
+            seen[defense_card] = True
+    for card in state.seen_cards:
+        seen[card] = True
+    return seen
+
+
+class DurakEnv:
+    """Gym-style wrapper around the Durak environment."""
+
+    def __init__(self, seed: Optional[int] = None):
+        self.rng = np.random.default_rng(seed)
+        self.state: Optional[DurakState] = None
+
+    def reset(self) -> Dict[str, np.ndarray]:
+        self.state = initial_state(self.rng)
+        return self._build_observation()
+
+    def step(self, action: int) -> Tuple[Optional[Dict[str, np.ndarray]], float, bool, Dict]:
+        if self.state is None:
+            raise RuntimeError("Environment must be reset before stepping.")
+        if action is None:
+            raise ValueError("Action cannot be None.")
+        self.state, done, winner = apply_action(self.state, action)
+        if done:
+            reward = 1.0 if winner == 0 else -1.0
             obs = None
         else:
-            obs = get_obs(self.infoset)
-        return obs, reward, done, {}
+            reward = 0.0
+            obs = self._build_observation()
+        return obs, reward, done, {"winner": winner}
 
-    def _get_reward(self):
-        """
-        This function is called in the end of each
-        game. It returns either 1/-1 for win/loss,
-        or ADP, i.e., every bomb will double the score.
-        """
-        winner = self._game_winner
-        bomb_num = self._game_bomb_num
-        if winner == 'landlord':
-            if self.objective == 'adp':
-                return 2.0 ** bomb_num
-            elif self.objective == 'logadp':
-                return bomb_num + 1.0
-            else:
-                return 1.0
-        else:
-            if self.objective == 'adp':
-                return -2.0 ** bomb_num
-            elif self.objective == 'logadp':
-                return -bomb_num - 1.0
-            else:
-                return -1.0
+    def close(self) -> None:
+        self.state = None
 
-    @property
-    def _game_infoset(self):
-        """
-        Here, inforset is defined as all the information
-        in the current situation, incuding the hand cards
-        of all the players, all the historical moves, etc.
-        That is, it contains perferfect infomation. Later,
-        we will use functions to extract the observable
-        information from the views of the three players.
-        """
-        return self._env.game_infoset
+    def _build_observation(self) -> Dict[str, np.ndarray]:
+        assert self.state is not None
+        state = self.state
+        player = current_player(state)
+        opponent = 1 - player
+        position = f"player_{player}"
 
-    @property
-    def _game_bomb_num(self):
-        """
-        The number of bombs played so far. This is used as
-        a feature of the neural network and is also used to
-        calculate ADP.
-        """
-        return self._env.get_bomb_num()
+        state_vector = _encode_state_vector(state, player)
+        legal_mask = legal_actions(state)
+        legal_ids = np.flatnonzero(legal_mask)
+        if legal_ids.size == 0:
+            raise RuntimeError("State has no legal actions available.")
+        action_embeddings = np.stack([_action_to_vector(a) for a in legal_ids], axis=0)
 
-    @property
-    def _game_winner(self):
-        """ A string of landlord/peasants
-        """
-        return self._env.get_winner()
+        assert state_vector.shape[0] == STATE_VECTOR_LENGTH
 
-    @property
-    def _acting_player_position(self):
-        """
-        The player that is active. It can be landlord,
-        landlod_down, or landlord_up.
-        """
-        return self._env.acting_player_position
+        return {
+            "position": position,
+            "state": state_vector.astype(np.float32),
+            "legal_actions": legal_ids.astype(np.int64),
+            "action_embeddings": action_embeddings.astype(np.float32),
+        }
 
-    @property
-    def _game_over(self):
-        """ Returns a Boolean
-        """
-        return self._env.game_over
 
-class DummyAgent(object):
-    """
-    Dummy agent is designed to easily interact with the
-    game engine. The agent will first be told what action
-    to perform. Then the environment will call this agent
-    to perform the actual action. This can help us to
-    isolate environment and agents towards a gym like
-    interface.
-    """
-    def __init__(self, position):
-        self.position = position
-        self.action = None
+def _encode_state_vector(state: DurakState, player: int) -> np.ndarray:
+    opponent = 1 - player
+    attacker = state.attacker
+    defender = state.defender
 
-    def act(self, infoset):
-        """
-        Simply return the action that is set previously.
-        """
-        assert self.action in infoset.legal_actions
-        return self.action
+    player_hand = np.zeros(NUM_CARDS, dtype=np.float32)
+    for card in state.hands[player]:
+        player_hand[card] = 1.0
 
-    def set_action(self, action):
-        """
-        The environment uses this function to tell
-        the dummy agent what to do.
-        """
-        self.action = action
+    table_attack = np.zeros(NUM_CARDS, dtype=np.float32)
+    table_defense = np.zeros(NUM_CARDS, dtype=np.float32)
+    for atk, defense in state.table:
+        table_attack[atk] = 1.0
+        if defense is not None:
+            table_defense[defense] = 1.0
 
-def get_obs(infoset):
-    """
-    This function obtains observations with imperfect information
-    from the infoset. It has three branches since we encode
-    different features for different positions.
-    
-    This function will return dictionary named `obs`. It contains
-    several fields. These fields will be used to train the model.
-    One can play with those features to improve the performance.
+    seen = discard_seen(state).astype(np.float32)
 
-    `position` is a string that can be landlord/landlord_down/landlord_up
+    trump_suit_vec = np.zeros(len(SUITS), dtype=np.float32)
+    trump_suit_vec[state.trump_suit] = 1.0
 
-    `x_batch` is a batch of features (excluding the hisorical moves).
-    It also encodes the action feature
+    trump_rank_vec = np.zeros(len(RANKS), dtype=np.float32)
+    trump_rank_vec[card_rank(state.trump_card)] = 1.0
 
-    `z_batch` is a batch of features with hisorical moves only.
-
-    `legal_actions` is the legal moves
-
-    `x_no_action`: the features (exluding the hitorical moves and
-    the action features). It does not have the batch dim.
-
-    `z`: same as z_batch but not a batch.
-    """
-    if infoset.player_position == 'landlord':
-        return _get_obs_landlord(infoset)
-    elif infoset.player_position == 'landlord_up':
-        return _get_obs_landlord_up(infoset)
-    elif infoset.player_position == 'landlord_down':
-        return _get_obs_landlord_down(infoset)
+    last_winner_vec = np.zeros(3, dtype=np.float32)
+    if state.last_round_winner is None:
+        last_winner_vec[0] = 1.0
+    elif state.last_round_winner == 0:
+        last_winner_vec[1] = 1.0
     else:
-        raise ValueError('')
+        last_winner_vec[2] = 1.0
 
-def _get_one_hot_array(num_left_cards, max_num_cards):
-    """
-    A utility function to obtain one-hot endoding
-    """
-    one_hot = np.zeros(max_num_cards)
-    one_hot[num_left_cards - 1] = 1
+    current_player_vec = np.zeros(2, dtype=np.float32)
+    current_player_vec[player] = 1.0
 
-    return one_hot
+    attacker_vec = np.zeros(2, dtype=np.float32)
+    attacker_vec[attacker] = 1.0
 
-def _cards2array(list_cards):
-    """
-    A utility function that transforms the actions, i.e.,
-    A list of integers into card matrix. Here we remove
-    the six entries that are always zero and flatten the
-    the representations.
-    """
-    if len(list_cards) == 0:
-        return np.zeros(54, dtype=np.int8)
+    defender_vec = np.zeros(2, dtype=np.float32)
+    defender_vec[defender] = 1.0
 
-    matrix = np.zeros([4, 13], dtype=np.int8)
-    jokers = np.zeros(2, dtype=np.int8)
-    counter = Counter(list_cards)
-    for card, num_times in counter.items():
-        if card < 20:
-            matrix[:, Card2Column[card]] = NumOnes2Array[num_times]
-        elif card == 20:
-            jokers[0] = 1
-        elif card == 30:
-            jokers[1] = 1
-    return np.concatenate((matrix.flatten('F'), jokers))
+    counts = np.array([
+        len(state.hands[player]) / NUM_CARDS,
+        len(state.hands[opponent]) / NUM_CARDS,
+        len(state.hands[attacker]) / NUM_CARDS,
+        len(state.hands[defender]) / NUM_CARDS,
+        len(state.talon) / NUM_CARDS,
+        state.round_attack_limit / MAX_ATTACK_CARDS,
+        float(state.defender_taking),
+        state.post_take_additions_remaining / MAX_ATTACK_CARDS,
+        1.0 if state.phase == "attack" else 0.0,
+        1.0 if player == attacker else 0.0,
+        len(state.table) / MAX_ATTACK_CARDS,
+        1.0 if not state.talon else 0.0,
+    ], dtype=np.float32)
 
-def _action_seq_list2array(action_seq_list):
-    """
-    A utility function to encode the historical moves.
-    We encode the historical 15 actions. If there is
-    no 15 actions, we pad the features with 0. Since
-    three moves is a round in DouDizhu, we concatenate
-    the representations for each consecutive three moves.
-    Finally, we obtain a 5x162 matrix, which will be fed
-    into LSTM for encoding.
-    """
-    action_seq_array = np.zeros((len(action_seq_list), 54))
-    for row, list_cards in enumerate(action_seq_list):
-        action_seq_array[row, :] = _cards2array(list_cards)
-    action_seq_array = action_seq_array.reshape(5, 162)
-    return action_seq_array
+    feature_list = [
+        player_hand,
+        table_attack,
+        table_defense,
+        seen,
+        trump_suit_vec,
+        trump_rank_vec,
+        last_winner_vec,
+        current_player_vec,
+        attacker_vec,
+        defender_vec,
+        counts,
+    ]
+    return np.concatenate(feature_list, axis=0)
 
-def _process_action_seq(sequence, length=15):
-    """
-    A utility function encoding historical moves. We
-    encode 15 moves. If there is no 15 moves, we pad
-    with zeros.
-    """
-    sequence = sequence[-length:].copy()
-    if len(sequence) < length:
-        empty_sequence = [[] for _ in range(length - len(sequence))]
-        empty_sequence.extend(sequence)
-        sequence = empty_sequence
-    return sequence
 
-def _get_one_hot_bomb(bomb_num):
-    """
-    A utility function to encode the number of bombs
-    into one-hot representation.
-    """
-    one_hot = np.zeros(15)
-    one_hot[bomb_num] = 1
-    return one_hot
+def _action_to_vector(action: int) -> np.ndarray:
+    vec = np.zeros(ACTION_VECTOR_LENGTH, dtype=np.float32)
+    if 0 <= action < NUM_CARDS:
+        vec[action] = 1.0
+    elif action in (ACTION_END_ATTACK, ACTION_TAKE_CARDS):
+        vec[action] = 1.0
+    else:
+        raise ValueError(f"Invalid action id: {action}")
+    return vec
 
-def _get_obs_landlord(infoset):
-    """
-    Obttain the landlord features. See Table 4 in
-    https://arxiv.org/pdf/2106.06135.pdf
-    """
-    num_legal_actions = len(infoset.legal_actions)
-    my_handcards = _cards2array(infoset.player_hand_cards)
-    my_handcards_batch = np.repeat(my_handcards[np.newaxis, :],
-                                   num_legal_actions, axis=0)
 
-    other_handcards = _cards2array(infoset.other_hand_cards)
-    other_handcards_batch = np.repeat(other_handcards[np.newaxis, :],
-                                      num_legal_actions, axis=0)
-
-    last_action = _cards2array(infoset.last_move)
-    last_action_batch = np.repeat(last_action[np.newaxis, :],
-                                  num_legal_actions, axis=0)
-
-    my_action_batch = np.zeros(my_handcards_batch.shape)
-    for j, action in enumerate(infoset.legal_actions):
-        my_action_batch[j, :] = _cards2array(action)
-
-    landlord_up_num_cards_left = _get_one_hot_array(
-        infoset.num_cards_left_dict['landlord_up'], 17)
-    landlord_up_num_cards_left_batch = np.repeat(
-        landlord_up_num_cards_left[np.newaxis, :],
-        num_legal_actions, axis=0)
-
-    landlord_down_num_cards_left = _get_one_hot_array(
-        infoset.num_cards_left_dict['landlord_down'], 17)
-    landlord_down_num_cards_left_batch = np.repeat(
-        landlord_down_num_cards_left[np.newaxis, :],
-        num_legal_actions, axis=0)
-
-    landlord_up_played_cards = _cards2array(
-        infoset.played_cards['landlord_up'])
-    landlord_up_played_cards_batch = np.repeat(
-        landlord_up_played_cards[np.newaxis, :],
-        num_legal_actions, axis=0)
-
-    landlord_down_played_cards = _cards2array(
-        infoset.played_cards['landlord_down'])
-    landlord_down_played_cards_batch = np.repeat(
-        landlord_down_played_cards[np.newaxis, :],
-        num_legal_actions, axis=0)
-
-    bomb_num = _get_one_hot_bomb(
-        infoset.bomb_num)
-    bomb_num_batch = np.repeat(
-        bomb_num[np.newaxis, :],
-        num_legal_actions, axis=0)
-
-    x_batch = np.hstack((my_handcards_batch,
-                         other_handcards_batch,
-                         last_action_batch,
-                         landlord_up_played_cards_batch,
-                         landlord_down_played_cards_batch,
-                         landlord_up_num_cards_left_batch,
-                         landlord_down_num_cards_left_batch,
-                         bomb_num_batch,
-                         my_action_batch))
-    x_no_action = np.hstack((my_handcards,
-                             other_handcards,
-                             last_action,
-                             landlord_up_played_cards,
-                             landlord_down_played_cards,
-                             landlord_up_num_cards_left,
-                             landlord_down_num_cards_left,
-                             bomb_num))
-    z = _action_seq_list2array(_process_action_seq(
-        infoset.card_play_action_seq))
-    z_batch = np.repeat(
-        z[np.newaxis, :, :],
-        num_legal_actions, axis=0)
-    obs = {
-            'position': 'landlord',
-            'x_batch': x_batch.astype(np.float32),
-            'z_batch': z_batch.astype(np.float32),
-            'legal_actions': infoset.legal_actions,
-            'x_no_action': x_no_action.astype(np.int8),
-            'z': z.astype(np.int8),
-          }
-    return obs
-
-def _get_obs_landlord_up(infoset):
-    """
-    Obttain the landlord_up features. See Table 5 in
-    https://arxiv.org/pdf/2106.06135.pdf
-    """
-    num_legal_actions = len(infoset.legal_actions)
-    my_handcards = _cards2array(infoset.player_hand_cards)
-    my_handcards_batch = np.repeat(my_handcards[np.newaxis, :],
-                                   num_legal_actions, axis=0)
-
-    other_handcards = _cards2array(infoset.other_hand_cards)
-    other_handcards_batch = np.repeat(other_handcards[np.newaxis, :],
-                                      num_legal_actions, axis=0)
-
-    last_action = _cards2array(infoset.last_move)
-    last_action_batch = np.repeat(last_action[np.newaxis, :],
-                                  num_legal_actions, axis=0)
-
-    my_action_batch = np.zeros(my_handcards_batch.shape)
-    for j, action in enumerate(infoset.legal_actions):
-        my_action_batch[j, :] = _cards2array(action)
-
-    last_landlord_action = _cards2array(
-        infoset.last_move_dict['landlord'])
-    last_landlord_action_batch = np.repeat(
-        last_landlord_action[np.newaxis, :],
-        num_legal_actions, axis=0)
-    landlord_num_cards_left = _get_one_hot_array(
-        infoset.num_cards_left_dict['landlord'], 20)
-    landlord_num_cards_left_batch = np.repeat(
-        landlord_num_cards_left[np.newaxis, :],
-        num_legal_actions, axis=0)
-
-    landlord_played_cards = _cards2array(
-        infoset.played_cards['landlord'])
-    landlord_played_cards_batch = np.repeat(
-        landlord_played_cards[np.newaxis, :],
-        num_legal_actions, axis=0)
-
-    last_teammate_action = _cards2array(
-        infoset.last_move_dict['landlord_down'])
-    last_teammate_action_batch = np.repeat(
-        last_teammate_action[np.newaxis, :],
-        num_legal_actions, axis=0)
-    teammate_num_cards_left = _get_one_hot_array(
-        infoset.num_cards_left_dict['landlord_down'], 17)
-    teammate_num_cards_left_batch = np.repeat(
-        teammate_num_cards_left[np.newaxis, :],
-        num_legal_actions, axis=0)
-
-    teammate_played_cards = _cards2array(
-        infoset.played_cards['landlord_down'])
-    teammate_played_cards_batch = np.repeat(
-        teammate_played_cards[np.newaxis, :],
-        num_legal_actions, axis=0)
-
-    bomb_num = _get_one_hot_bomb(
-        infoset.bomb_num)
-    bomb_num_batch = np.repeat(
-        bomb_num[np.newaxis, :],
-        num_legal_actions, axis=0)
-
-    x_batch = np.hstack((my_handcards_batch,
-                         other_handcards_batch,
-                         landlord_played_cards_batch,
-                         teammate_played_cards_batch,
-                         last_action_batch,
-                         last_landlord_action_batch,
-                         last_teammate_action_batch,
-                         landlord_num_cards_left_batch,
-                         teammate_num_cards_left_batch,
-                         bomb_num_batch,
-                         my_action_batch))
-    x_no_action = np.hstack((my_handcards,
-                             other_handcards,
-                             landlord_played_cards,
-                             teammate_played_cards,
-                             last_action,
-                             last_landlord_action,
-                             last_teammate_action,
-                             landlord_num_cards_left,
-                             teammate_num_cards_left,
-                             bomb_num))
-    z = _action_seq_list2array(_process_action_seq(
-        infoset.card_play_action_seq))
-    z_batch = np.repeat(
-        z[np.newaxis, :, :],
-        num_legal_actions, axis=0)
-    obs = {
-            'position': 'landlord_up',
-            'x_batch': x_batch.astype(np.float32),
-            'z_batch': z_batch.astype(np.float32),
-            'legal_actions': infoset.legal_actions,
-            'x_no_action': x_no_action.astype(np.int8),
-            'z': z.astype(np.int8),
-          }
-    return obs
-
-def _get_obs_landlord_down(infoset):
-    """
-    Obttain the landlord_down features. See Table 5 in
-    https://arxiv.org/pdf/2106.06135.pdf
-    """
-    num_legal_actions = len(infoset.legal_actions)
-    my_handcards = _cards2array(infoset.player_hand_cards)
-    my_handcards_batch = np.repeat(my_handcards[np.newaxis, :],
-                                   num_legal_actions, axis=0)
-
-    other_handcards = _cards2array(infoset.other_hand_cards)
-    other_handcards_batch = np.repeat(other_handcards[np.newaxis, :],
-                                      num_legal_actions, axis=0)
-
-    last_action = _cards2array(infoset.last_move)
-    last_action_batch = np.repeat(last_action[np.newaxis, :],
-                                  num_legal_actions, axis=0)
-
-    my_action_batch = np.zeros(my_handcards_batch.shape)
-    for j, action in enumerate(infoset.legal_actions):
-        my_action_batch[j, :] = _cards2array(action)
-
-    last_landlord_action = _cards2array(
-        infoset.last_move_dict['landlord'])
-    last_landlord_action_batch = np.repeat(
-        last_landlord_action[np.newaxis, :],
-        num_legal_actions, axis=0)
-    landlord_num_cards_left = _get_one_hot_array(
-        infoset.num_cards_left_dict['landlord'], 20)
-    landlord_num_cards_left_batch = np.repeat(
-        landlord_num_cards_left[np.newaxis, :],
-        num_legal_actions, axis=0)
-
-    landlord_played_cards = _cards2array(
-        infoset.played_cards['landlord'])
-    landlord_played_cards_batch = np.repeat(
-        landlord_played_cards[np.newaxis, :],
-        num_legal_actions, axis=0)
-
-    last_teammate_action = _cards2array(
-        infoset.last_move_dict['landlord_up'])
-    last_teammate_action_batch = np.repeat(
-        last_teammate_action[np.newaxis, :],
-        num_legal_actions, axis=0)
-    teammate_num_cards_left = _get_one_hot_array(
-        infoset.num_cards_left_dict['landlord_up'], 17)
-    teammate_num_cards_left_batch = np.repeat(
-        teammate_num_cards_left[np.newaxis, :],
-        num_legal_actions, axis=0)
-
-    teammate_played_cards = _cards2array(
-        infoset.played_cards['landlord_up'])
-    teammate_played_cards_batch = np.repeat(
-        teammate_played_cards[np.newaxis, :],
-        num_legal_actions, axis=0)
-
-    landlord_played_cards = _cards2array(
-        infoset.played_cards['landlord'])
-    landlord_played_cards_batch = np.repeat(
-        landlord_played_cards[np.newaxis, :],
-        num_legal_actions, axis=0)
-
-    bomb_num = _get_one_hot_bomb(
-        infoset.bomb_num)
-    bomb_num_batch = np.repeat(
-        bomb_num[np.newaxis, :],
-        num_legal_actions, axis=0)
-
-    x_batch = np.hstack((my_handcards_batch,
-                         other_handcards_batch,
-                         landlord_played_cards_batch,
-                         teammate_played_cards_batch,
-                         last_action_batch,
-                         last_landlord_action_batch,
-                         last_teammate_action_batch,
-                         landlord_num_cards_left_batch,
-                         teammate_num_cards_left_batch,
-                         bomb_num_batch,
-                         my_action_batch))
-    x_no_action = np.hstack((my_handcards,
-                             other_handcards,
-                             landlord_played_cards,
-                             teammate_played_cards,
-                             last_action,
-                             last_landlord_action,
-                             last_teammate_action,
-                             landlord_num_cards_left,
-                             teammate_num_cards_left,
-                             bomb_num))
-    z = _action_seq_list2array(_process_action_seq(
-        infoset.card_play_action_seq))
-    z_batch = np.repeat(
-        z[np.newaxis, :, :],
-        num_legal_actions, axis=0)
-    obs = {
-            'position': 'landlord_down',
-            'x_batch': x_batch.astype(np.float32),
-            'z_batch': z_batch.astype(np.float32),
-            'legal_actions': infoset.legal_actions,
-            'x_no_action': x_no_action.astype(np.int8),
-            'z': z.astype(np.int8),
-          }
-    return obs
+def create_env(seed: Optional[int] = None) -> DurakEnv:
+    return DurakEnv(seed=seed)
